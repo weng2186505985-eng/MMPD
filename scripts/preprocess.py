@@ -37,7 +37,7 @@ def preprocess_mission1_compact(data_root, output_dir, freq='1min'):
         path = os.path.join(data_root, 'channels', c, c)
         try:
             df = pd.read_pickle(path)
-            resampled = df.resample(freq).mean().reindex(global_index).ffill().bfill()
+            resampled = df.resample(freq).mean().reindex(global_index).interpolate(method='linear', limit_direction='both').fillna(0)
             if resampled.isnull().mean().values[0] < 0.3:
                 tm_mmap[:, i] = resampled.iloc[:, 0].values.astype(np.float32)
                 used_tm.append(c)
@@ -46,7 +46,7 @@ def preprocess_mission1_compact(data_root, output_dir, freq='1min'):
     
     # Fill gaps for valid TM
     for i in tqdm(tm_indices, desc="Filling TM gaps"):
-        col = pd.Series(tm_mmap[:, i]).ffill().bfill().fillna(0)
+        col = pd.Series(tm_mmap[:, i]).interpolate(method='linear', limit_direction='both').fillna(0)
         tm_mmap[:, i] = col.values
     
     # 3. Screen and Process TC (int8)

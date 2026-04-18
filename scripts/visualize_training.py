@@ -118,7 +118,7 @@ def plot_training_dashboard(history, output_dir='results'):
     best_vals = [v for v, is_best in zip(metrics['val_total'], metrics['is_best']) if is_best]
     if best_epochs:
         ax1.scatter(best_epochs, best_vals, color=COLORS['best'], s=120, zorder=5,
-                    marker='★', label=f'Best (Epoch {best_epochs[-1]})')
+                    marker='*', label=f'Best (Epoch {best_epochs[-1]})')
     
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Total Loss')

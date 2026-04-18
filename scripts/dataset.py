@@ -53,7 +53,13 @@ class MMPDDataset(Dataset):
         else:
             x_cond, x_0 = tm_cond, tm_0
         
-        return torch.from_numpy(x_cond), torch.from_numpy(x_0)
+        # Labels
+        if self.label_mmap is not None:
+            label = self.label_mmap[start + self.seq_len : start + self.seq_len + self.pred_len]
+        else:
+            label = np.zeros(self.pred_len, dtype=np.int8)
+            
+        return torch.from_numpy(x_cond), torch.from_numpy(x_0), torch.from_numpy(label)
 
 def get_dataloaders(metadata_file, config):
     with open(metadata_file, 'rb') as f:
@@ -90,4 +96,8 @@ def get_dataloaders(metadata_file, config):
                             persistent_workers=(num_workers > 0),
                             prefetch_factor=2 if num_workers > 0 else None)
     
-    return train_loader, val_loader, len(meta['features'])
+    return train_loader, val_loader, {
+        'enc_in': len(meta['features']),
+        'num_tm': len(meta['tm_features']),
+        'num_tc': len(meta['tc_features'])
+    }

@@ -36,6 +36,8 @@ def run_inference(config, model_path):
     
     # 2. Load Model
     config['enc_in'] = len(meta['features'])
+    config['num_tm'] = len(meta['tm_features'])
+    config['num_tc'] = len(meta['tc_features'])
     model = MMPD(config).to(device)
     checkpoint = torch.load(model_path, map_location=device)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -58,22 +60,29 @@ def run_inference(config, model_path):
     print(f"Stage 1: Rough Screening (MSE) on {len(starts)} windows...")
     stage1_scores = []
     
+    batch_size = config.get('infer_batch_size', 64)
     with torch.no_grad():
-        for start in tqdm(starts):
-            # Absolute indices
-            abs_start = start_idx + start
-            
-            # TM + TC
-            tm_cond = tm_mmap[abs_start : abs_start + seq_len, meta['tm_indices']]
-            tm_0 = tm_mmap[abs_start + seq_len : abs_start + seq_len + pred_len, meta['tm_indices']]
-            tc_cond = tc_mmap[abs_start : abs_start + seq_len, :].astype(np.float32)
-            tc_0 = tc_mmap[abs_start + seq_len : abs_start + seq_len + pred_len, :].astype(np.float32)
-            
-            x_cond = torch.from_numpy(np.concatenate([tm_cond, tc_cond], axis=-1)).unsqueeze(0).to(device)
-            x_0 = torch.from_numpy(np.concatenate([tm_0, tc_0], axis=-1)).unsqueeze(0).to(device)
+        for i in tqdm(range(0, len(starts), batch_size)):
+            batch_starts = starts[i:i+batch_size]
+            x_cond_list, x_0_list = [], []
+            for start in batch_starts:
+                abs_start = start_idx + start
+                
+                tm_cond = tm_mmap[abs_start : abs_start + seq_len, meta['tm_indices']]
+                tm_0 = tm_mmap[abs_start + seq_len : abs_start + seq_len + pred_len, meta['tm_indices']]
+                tc_cond = tc_mmap[abs_start : abs_start + seq_len, :].astype(np.float32)
+                tc_0 = tc_mmap[abs_start + seq_len : abs_start + seq_len + pred_len, :].astype(np.float32)
+                
+                x_cond_list.append(np.concatenate([tm_cond, tc_cond], axis=-1))
+                x_0_list.append(np.concatenate([tm_0, tc_0], axis=-1))
+                
+            x_cond = torch.from_numpy(np.array(x_cond_list)).to(device)
+            x_0 = torch.from_numpy(np.array(x_0_list)).to(device)
             
             mse = model.get_mse_recon(x_cond, x_0)
-            stage1_scores.append(mse.mean().item())
+            B = x_cond.shape[0]
+            mse_mean = mse.reshape(B, -1).mean(dim=1).cpu().numpy()
+            stage1_scores.extend(mse_mean)
             
     stage1_scores = np.array(stage1_scores)
     threshold_idx = int(len(stage1_scores) * 0.95)
@@ -91,47 +100,70 @@ def run_inference(config, model_path):
     # Stage 2: Fine Scoring
     print(f"Stage 2: Refining {len(to_refine_indices)} windows...")
     def gmm_log_prob(x_obs, mu, pi, sigma):
-        K, pred_len, C = mu.shape
-        x_obs = x_obs.T 
+        B, K, pred_len, C = mu.shape
         log_probs = []
         for k in range(K):
-            mu_k = mu[k].T
+            mu_k = mu[:, k, :, :]
             diff_sq = ((x_obs - mu_k)**2).sum(dim=1)
-            lp_k = -0.5 * pred_len * np.log(2 * np.pi) - pred_len * torch.log(sigma[:, k]) - 0.5 * diff_sq / (sigma[:, k]**2)
-            log_probs.append(lp_k + torch.log(pi[:, k] + 1e-6))
-        return torch.logsumexp(torch.stack(log_probs, dim=1), dim=1)
+            lp_k = -0.5 * pred_len * np.log(2 * np.pi) - pred_len * torch.log(sigma[:, :, k] + 1e-6) - 0.5 * diff_sq / (sigma[:, :, k]**2 + 1e-6)
+            log_probs.append(lp_k + torch.log(pi[:, :, k] + 1e-6))
+        log_probs = torch.stack(log_probs, dim=2)
+        return torch.logsumexp(log_probs, dim=2)
 
-    for idx in tqdm(to_refine_indices):
-        start = starts[idx]
-        abs_start = start_idx + start
+    diff_batch_size = config.get('diff_batch_size', 8)
+    for i in tqdm(range(0, len(to_refine_indices), diff_batch_size)):
+        batch_indices = to_refine_indices[i:i+diff_batch_size]
         
-        tm_cond = tm_mmap[abs_start : abs_start + seq_len, meta['tm_indices']]
-        tm_0 = tm_mmap[abs_start + seq_len : abs_start + seq_len + pred_len, meta['tm_indices']]
-        tc_cond = tc_mmap[abs_start : abs_start + seq_len, :].astype(np.float32)
-        tc_0 = tc_mmap[abs_start + seq_len : abs_start + seq_len + pred_len, :].astype(np.float32)
-        
-        x_cond = torch.from_numpy(np.concatenate([tm_cond, tc_cond], axis=-1)).unsqueeze(0).to(device)
-        x_obs = torch.from_numpy(np.concatenate([tm_0, tc_0], axis=-1)).to(device)
-        
-        mu_k, pi_k, sigma_k = model.sample(x_cond, num_samples=50, ddim_steps=20, gmm_K=config.get('gmm_K', 5))
-        lp = gmm_log_prob(x_obs, mu_k, pi_k, sigma_k)
-        nll = -lp.mean().item()
+        x_cond_list, x_obs_list = [], []
+        for idx in batch_indices:
+            start = starts[idx]
+            abs_start = start_idx + start
             
-        anomaly_scores[start + seq_len : start + seq_len + pred_len] = np.maximum(
-            anomaly_scores[start + seq_len : start + seq_len + pred_len], nll
-        )
+            tm_cond = tm_mmap[abs_start : abs_start + seq_len, meta['tm_indices']]
+            tm_0 = tm_mmap[abs_start + seq_len : abs_start + seq_len + pred_len, meta['tm_indices']]
+            tc_cond = tc_mmap[abs_start : abs_start + seq_len, :].astype(np.float32)
+            tc_0 = tc_mmap[abs_start + seq_len : abs_start + seq_len + pred_len, :].astype(np.float32)
+            
+            x_cond_list.append(np.concatenate([tm_cond, tc_cond], axis=-1))
+            x_obs_list.append(np.concatenate([tm_0, tc_0], axis=-1))
+            
+        x_cond = torch.from_numpy(np.array(x_cond_list)).to(device)
+        x_obs = torch.from_numpy(np.array(x_obs_list)).to(device)
+        
+        mu_k, pi_k, sigma_k = model.sample(x_cond, num_samples=config.get('num_samples', 50), ddim_steps=20, gmm_K=config.get('gmm_K', 5))
+        
+        x_obs_tm = x_obs[..., :config['num_tm']]
+        lp = gmm_log_prob(x_obs_tm, mu_k, pi_k, sigma_k)
+        nll = -lp.mean(dim=1).cpu().numpy()
+            
+        for b, idx in enumerate(batch_indices):
+            start = starts[idx]
+            anomaly_scores[start + seq_len : start + seq_len + pred_len] = np.maximum(
+                anomaly_scores[start + seq_len : start + seq_len + pred_len], nll[b]
+            )
         
     anomaly_scores = gaussian_filter1d(anomaly_scores, sigma=3)
     test_labels = label_mmap[start_idx : end_idx]
     
     return anomaly_scores, test_labels, time_index[start_idx : end_idx]
 
+def dynamic_ewma_threshold(scores, alpha=0.1, z=3.0):
+    ewma = np.zeros_like(scores)
+    ewma_std = np.zeros_like(scores)
+    ewma[0] = scores[0]
+    ewma_std[0] = 0
+    for i in range(1, len(scores)):
+        ewma[i] = alpha * scores[i] + (1 - alpha) * ewma[i-1]
+        var = alpha * (scores[i] - ewma[i])**2 + (1 - alpha) * ewma_std[i-1]**2
+        ewma_std[i] = np.sqrt(var)
+    return ewma + z * ewma_std
+
 def evaluate(scores, labels, times, threshold_pct=99, output_dir='results'):
     from sklearn.metrics import precision_recall_fscore_support
     os.makedirs(output_dir, exist_ok=True)
     
-    thresh = np.percentile(scores, threshold_pct)
-    pred = (scores > thresh).astype(int)
+    thresh_dynamic = dynamic_ewma_threshold(scores, alpha=0.1, z=3.0)
+    pred = (scores > thresh_dynamic).astype(int)
     
     # Event-wise Correction calculation
     def get_events(labels):
@@ -159,7 +191,7 @@ def evaluate(scores, labels, times, threshold_pct=99, output_dir='results'):
     p, r, f, _ = precision_recall_fscore_support(labels, corrected_pred, average='binary', beta=0.5)
     
     summary = (
-        f"Threshold (Percentile {threshold_pct}): {thresh:.4f}\n"
+        f"Dynamic Thresholding (EWMA)\n"
         f"Event-wise Corrected Precision: {p:.4f}\n"
         f"Event-wise Corrected Recall: {r:.4f}\n"
         f"Event-wise Corrected F0.5: {f:.4f}\n"

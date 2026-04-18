@@ -46,11 +46,13 @@ def train(config):
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB")
     
     # 1. Load Data
-    train_loader, val_loader, num_features = get_dataloaders(
+    train_loader, val_loader, data_meta = get_dataloaders(
         config['data_path'], config
     )
-    config['enc_in'] = num_features
-    print(f"Number of features: {num_features}")
+    config['enc_in'] = data_meta['enc_in']
+    config['num_tm'] = data_meta['num_tm']
+    config['num_tc'] = data_meta['num_tc']
+    print(f"Features: TM={config['num_tm']}, TC={config['num_tc']}, Total={config['enc_in']}")
     print(f"Training samples: {len(train_loader.dataset)}, Validation samples: {len(val_loader.dataset)}")
     
     # 2. Model
@@ -82,7 +84,8 @@ def train(config):
     }
     
     # 4. Training Loop
-    best_val_loss = float('inf')
+    best_val_metric = float('inf')
+    best_metric_name = ""
     patience = config.get('patience', 3)
     patience_counter = 0
     checkpoint_interval = config.get('checkpoint_interval', 5)  # 每N个epoch保存一次checkpoint
@@ -119,15 +122,14 @@ def train(config):
         curr_lr = optimizer.param_groups[0]['lr']
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['epochs']} [Train]")
         
-        for x_cond, x_0 in pbar:
+        for x_cond, x_0, _ in pbar:
             x_cond, x_0 = x_cond.to(device), x_0.to(device)
             
             optimizer.zero_grad()
             
             # Mixed Precision Forward
             with autocast(enabled=use_amp):
-                loss_diff, loss_recon = model(x_cond, x_0)
-                total_loss = loss_diff + config.get('lambda_recon', 0.1) * loss_recon
+                total_loss, loss_diff, loss_recon = model(x_cond, x_0)
             
             # Mixed Precision Backward
             scaler.scale(total_loss).backward()
@@ -162,15 +164,25 @@ def train(config):
         val_recon_loss = 0
         val_batches = 0
         
+        val_scores = []
+        val_labels = []
+        
         with torch.no_grad():
-            for x_cond, x_0 in tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['epochs']} [Val]", leave=False):
+            for x_cond, x_0, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['epochs']} [Val]", leave=False):
                 x_cond, x_0 = x_cond.to(device), x_0.to(device)
                 with autocast(enabled=use_amp):
-                    ld, lr = model(x_cond, x_0)
-                val_total_loss += (ld + config.get('lambda_recon', 0.1) * lr).item()
+                    total_loss, ld, lr = model(x_cond, x_0)
+                    mse_scores = model.get_mse_recon(x_cond, x_0)
+                val_total_loss += total_loss.item()
                 val_diff_loss += ld.item()
                 val_recon_loss += lr.item()
                 val_batches += 1
+                
+                # mse_scores is [B*num_tm]
+                B = x_cond.shape[0]
+                mse_scores = mse_scores.reshape(B, -1).max(dim=1)[0]
+                val_scores.append(mse_scores.cpu().numpy())
+                val_labels.append(labels.max(dim=1)[0].numpy())
         
         # ==================== Epoch Statistics ====================
         epoch_time = time.time() - epoch_start_time
@@ -214,9 +226,26 @@ def train(config):
         if gpu_mem_mb > 0:
             print(f"  GPU Memory: {gpu_mem_mb:.0f} MB")
         
+        val_scores = np.concatenate(val_scores)
+        val_labels = np.concatenate(val_labels)
+        
+        if val_labels.sum() > 0:
+            from sklearn.metrics import precision_recall_fscore_support
+            thresh = np.percentile(val_scores, 95)
+            preds = (val_scores > thresh).astype(int)
+            p, r, f05, _ = precision_recall_fscore_support(val_labels, preds, average='binary', beta=0.5, zero_division=0)
+            val_metric = -f05 # minimize
+            metric_str = f"F0.5={f05:.4f}"
+            print(f"  Val Anomalies: {val_labels.sum()} windows. P={p:.4f}, R={r:.4f}, F0.5={f05:.4f}")
+        else:
+            val_metric = avg_val_total
+            metric_str = f"Loss={avg_val_total:.6f}"
+            print(f"  Val Anomalies: 0 windows. Using Val Loss for Early Stopping.")
+            
         # ==================== Checkpointing ====================
-        if avg_val_total < best_val_loss:
-            best_val_loss = avg_val_total
+        if val_metric < best_val_metric:
+            best_val_metric = val_metric
+            best_metric_name = metric_str
             patience_counter = 0
             epoch_record['is_best'] = True
             
@@ -225,13 +254,13 @@ def train(config):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'best_val_loss': best_val_loss,
+                'best_val_metric': best_val_metric,
                 'config': config,
             }, 'checkpoints/best_mmpd.pth')
-            print(f"  ★ New Best Model Saved! (Val Loss: {best_val_loss:.6f})")
+            print(f"  ★ New Best Model Saved! (Val Metric: {metric_str})")
         else:
             patience_counter += 1
-            print(f"  EarlyStopping: {patience_counter}/{patience}")
+            print(f"  EarlyStopping: {patience_counter}/{patience} (Best: {best_metric_name})")
         
         # 定期保存checkpoint
         if (epoch + 1) % checkpoint_interval == 0:
@@ -240,7 +269,7 @@ def train(config):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'best_val_loss': best_val_loss,
+                'best_val_metric': best_val_metric,
                 'config': config,
             }, f'checkpoints/mmpd_epoch_{epoch+1}.pth')
             print(f"  Checkpoint saved: checkpoints/mmpd_epoch_{epoch+1}.pth")
@@ -271,7 +300,7 @@ def train(config):
     # ==================== Training Complete ====================
     total_time = time.time() - total_start_time
     history['total_training_time_sec'] = total_time
-    history['best_val_loss'] = best_val_loss
+    history['best_val_metric'] = best_val_metric
     
     with open('results/train_history.json', 'w', encoding='utf-8') as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
@@ -280,7 +309,7 @@ def train(config):
     print(f"  Training Complete!")
     print(f"{'='*60}")
     print(f"  Total Time:      {total_time/60:.1f} minutes")
-    print(f"  Best Val Loss:   {best_val_loss:.6f}")
+    print(f"  Best Val Metric: {best_metric_name}")
     print(f"  Epochs Trained:  {len(history['epochs'])}")
     print(f"  History saved:   results/train_history.json")
     print(f"{'='*60}")
