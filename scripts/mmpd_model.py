@@ -106,6 +106,25 @@ class TransformerDenoiser(nn.Module):
         out = self.transformer(x) # [B*C, N, D]
         return self.out_proj(out)
 
+class PatchConsistentMLP(nn.Module):
+    def __init__(self, d_model, patch_len, d_ff):
+        super(PatchConsistentMLP, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model + patch_len + 64 + patch_len*2, d_ff),
+            nn.ReLU(),
+            nn.Linear(d_ff, d_ff),
+            nn.ReLU(),
+            nn.Linear(d_ff, patch_len)
+        )
+        
+    def forward(self, x_t, H, t_emb):
+        B_C, N, P = x_t.shape
+        x_padded = F.pad(x_t, (0, 0, 1, 1), mode='constant', value=0)
+        left_x = x_padded[:, :-2, :]
+        right_x = x_padded[:, 2:, :]
+        feat = torch.cat([x_t, H, t_emb, left_x, right_x], dim=-1)
+        return self.mlp(feat)
+
 class MMPD(nn.Module):
     def __init__(self, config):
         super(MMPD, self).__init__()
@@ -115,8 +134,9 @@ class MMPD(nn.Module):
         self.pred_len = config['pred_len']
         
         self.num_tm = config.get('num_tm', config['enc_in'])
-        self.num_tc = config.get('num_tc', 0)
+        self.num_tc = config.get('num_tc', 0) if not config.get('ablation_no_tc', False) else 0
         self.patch_stride = config['patch_stride']
+        self.ablation_no_uw = config.get('ablation_no_uw', False)
         
         self.revin = RevIN(self.num_tm)
         self.backbone = PatchTSTBackbone(
@@ -127,7 +147,10 @@ class MMPD(nn.Module):
         if self.num_tc > 0:
             self.tc_proj = nn.Linear(self.num_tc * self.patch_len, config['d_model'])
             
-        self.denoiser = TransformerDenoiser(config['d_model'], config['patch_len'], config['d_ff'], config['n_heads'])
+        if config.get('ablation_no_transformer', False):
+            self.denoiser = PatchConsistentMLP(config['d_model'], config['patch_len'], config['d_ff'])
+        else:
+            self.denoiser = TransformerDenoiser(config['d_model'], config['patch_len'], config['d_ff'], config['n_heads'])
         
         # Time embedding
         self.t_embedder = nn.Sequential(
@@ -245,9 +268,12 @@ class MMPD(nn.Module):
         
         loss_diff = F.mse_loss(noise_pred, noise)
         
-        loss_diff_w = torch.exp(-self.log_var_diff) * loss_diff + self.log_var_diff
-        loss_recon_w = torch.exp(-self.log_var_recon) * loss_recon + self.log_var_recon
-        total_loss = loss_diff_w + loss_recon_w
+        if self.ablation_no_uw:
+            total_loss = loss_diff + lambda_recon * loss_recon
+        else:
+            loss_diff_w = torch.exp(-self.log_var_diff) * loss_diff + self.log_var_diff
+            loss_recon_w = torch.exp(-self.log_var_recon) * loss_recon + self.log_var_recon
+            total_loss = loss_diff_w + loss_recon_w
         
         return total_loss, loss_diff, loss_recon
 
