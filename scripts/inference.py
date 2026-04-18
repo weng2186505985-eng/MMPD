@@ -1,9 +1,14 @@
+import os
+import sys
+
+# Add the project root to sys.path to allow importing from 'scripts'
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import torch
 import numpy as np
 import pandas as pd
 import pickle
 import json
-import os
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter1d
 from sklearn.mixture import GaussianMixture
@@ -32,7 +37,11 @@ def run_inference(config, model_path):
     # 2. Load Model
     config['enc_in'] = len(meta['features'])
     model = MMPD(config).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    checkpoint = torch.load(model_path, map_location=device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
     model.eval()
     
     seq_len = config['seq_len']

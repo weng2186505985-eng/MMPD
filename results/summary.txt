@@ -1,0 +1,4 @@
+Threshold (Percentile 99): 25589538.0000
+Event-wise Corrected Precision: 0.9062
+Event-wise Corrected Recall: 0.8598
+Event-wise Corrected F0.5: 0.8965
