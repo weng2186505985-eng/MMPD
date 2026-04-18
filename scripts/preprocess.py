@@ -3,6 +3,33 @@ import os
 import numpy as np
 from tqdm import tqdm
 import pickle
+import multiprocessing as mp
+
+def process_tm_channel(args):
+    i, c, data_root, global_index, freq = args
+    path = os.path.join(data_root, 'channels', c, c)
+    try:
+        df = pd.read_pickle(path)
+        resampled = df.resample(freq).mean().reindex(global_index).interpolate(method='linear', limit_direction='both').fillna(0)
+        if resampled.isnull().mean().values[0] < 0.3:
+            return (i, c, resampled.iloc[:, 0].values.astype(np.float32))
+    except:
+        pass
+    return None
+
+def process_tc_channel(args):
+    tc, data_root, global_index, freq = args
+    path = os.path.join(data_root, 'telecommands', tc, tc)
+    try:
+        df_tc = pd.read_pickle(path)
+        if len(df_tc) > 0:
+            resampled = df_tc.resample(freq).count().reindex(global_index).fillna(0)
+            binary = (resampled.iloc[:, 0] > 0).astype(np.int8)
+            if binary.sum() > 0:
+                return (tc, binary.values)
+    except:
+        pass
+    return None
 
 def preprocess_mission1_compact(data_root, output_dir, freq='1min'):
     channels_csv = os.path.join(data_root, 'channels.csv')
@@ -30,19 +57,20 @@ def preprocess_mission1_compact(data_root, output_dir, freq='1min'):
     tm_mmap = np.memmap(tm_mmap_path, dtype='float32', mode='w+', shape=(num_timestamps, len(valid_tm)))
     tm_mmap[:] = np.nan
     
+    print(f"Processing {len(valid_tm)} TM channels using Multiprocessing (CPU cores: {mp.cpu_count()})...")
+    tm_args = [(i, c, data_root, global_index, freq) for i, c in enumerate(valid_tm)]
+    
     used_tm = []
     tm_indices = []
-    print("Processing TM...")
-    for i, c in enumerate(tqdm(valid_tm)):
-        path = os.path.join(data_root, 'channels', c, c)
-        try:
-            df = pd.read_pickle(path)
-            resampled = df.resample(freq).mean().reindex(global_index).interpolate(method='linear', limit_direction='both').fillna(0)
-            if resampled.isnull().mean().values[0] < 0.3:
-                tm_mmap[:, i] = resampled.iloc[:, 0].values.astype(np.float32)
-                used_tm.append(c)
-                tm_indices.append(i)
-        except: pass
+    with mp.Pool(processes=mp.cpu_count()) as pool:
+        results = list(tqdm(pool.imap(process_tm_channel, tm_args), total=len(tm_args), desc="Parallel TM"))
+        
+    for res in results:
+        if res is not None:
+            i, c, values = res
+            tm_mmap[:, i] = values
+            used_tm.append(c)
+            tm_indices.append(i)
     
     # Fill gaps for valid TM
     for i in tqdm(tm_indices, desc="Filling TM gaps"):
@@ -50,21 +78,19 @@ def preprocess_mission1_compact(data_root, output_dir, freq='1min'):
         tm_mmap[:, i] = col.values
     
     # 3. Screen and Process TC (int8)
+    print("Screening and Processing TC using Multiprocessing...")
+    tc_args = [(tc, data_root, global_index, freq) for tc in tcs_meta_df['Telecommand'] if os.path.exists(os.path.join(data_root, 'telecommands', tc, tc))]
+    
     valid_tc = []
     tc_events = []
-    print("Screening and Processing TC...")
-    for tc in tqdm(tcs_meta_df['Telecommand']):
-        path = os.path.join(data_root, 'telecommands', tc, tc)
-        if os.path.exists(path):
-            try:
-                df_tc = pd.read_pickle(path)
-                if len(df_tc) > 0:
-                    resampled = df_tc.resample(freq).count().reindex(global_index).fillna(0)
-                    binary = (resampled.iloc[:, 0] > 0).astype(np.int8)
-                    if binary.sum() > 0:
-                        valid_tc.append(tc)
-                        tc_events.append(binary.values)
-            except: pass
+    with mp.Pool(processes=mp.cpu_count()) as pool:
+        tc_results = list(tqdm(pool.imap(process_tc_channel, tc_args), total=len(tc_args), desc="Parallel TC"))
+        
+    for res in tc_results:
+        if res is not None:
+            tc, events = res
+            valid_tc.append(tc)
+            tc_events.append(events)
             
     tc_mmap_path = os.path.join(output_dir, 'mission1_tc.mmap')
     if valid_tc:
@@ -106,4 +132,7 @@ def preprocess_mission1_compact(data_root, output_dir, freq='1min'):
     print("Done. Storage optimized.")
 
 if __name__ == "__main__":
-    preprocess_mission1_compact('D:/bishe/ESA/data/ESA-Mission1/', 'D:/bishe/ESA/processed_data/')
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    data_dir = os.path.join(project_root, 'data', 'ESA-Mission1')
+    output_dir = os.path.join(project_root, 'processed_data')
+    preprocess_mission1_compact(data_dir, output_dir)

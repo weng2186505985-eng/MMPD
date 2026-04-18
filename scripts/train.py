@@ -43,7 +43,7 @@ def train(config):
     print(f"Using device: {device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     
     # 1. Load Data
     train_loader, val_loader, data_meta = get_dataloaders(
@@ -57,6 +57,7 @@ def train(config):
     
     # 2. Model
     model = MMPD(config).to(device)
+    config['lr'] = min(config.get('lr', 1e-4), 1e-4) # Clamp to max 1e-4
     optimizer = optim.Adam(model.parameters(), lr=config['lr'])
     
     # 模型参数统计
@@ -68,7 +69,7 @@ def train(config):
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'], eta_min=1e-6)
     
     # 2.2 Mixed Precision
-    use_amp = config.get('use_amp', True) and device.type == 'cuda'
+    use_amp = False # Force disable AMP to avoid FP16 overflow
     scaler = GradScaler(enabled=use_amp)
     if use_amp:
         print("Mixed Precision (AMP) enabled.")
@@ -128,8 +129,12 @@ def train(config):
             optimizer.zero_grad()
             
             # Mixed Precision Forward
-            with autocast(enabled=use_amp):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 total_loss, loss_diff, loss_recon = model(x_cond, x_0)
+                
+            if torch.isnan(loss_diff) or torch.isnan(loss_recon):
+                print("\nFatal Error: NaN detected in loss computation!")
+                break
             
             # Mixed Precision Backward
             scaler.scale(total_loss).backward()
@@ -170,7 +175,7 @@ def train(config):
         with torch.no_grad():
             for x_cond, x_0, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['epochs']} [Val]", leave=False):
                 x_cond, x_0 = x_cond.to(device), x_0.to(device)
-                with autocast(enabled=use_amp):
+                with torch.amp.autocast('cuda', enabled=use_amp):
                     total_loss, ld, lr = model(x_cond, x_0)
                     mse_scores = model.get_mse_recon(x_cond, x_0)
                 val_total_loss += total_loss.item()

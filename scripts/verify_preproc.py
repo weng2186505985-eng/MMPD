@@ -49,7 +49,7 @@ def verify_preprocessing(data_root, metadata_file):
     print("\nVerification complete.")
 
 if __name__ == "__main__":
-    verify_preprocessing(
-        data_root='D:/bishe/ESA/data/ESA-Mission1/',
-        metadata_file='D:/bishe/ESA/processed_data/mission1_metadata.pkl'
-    )
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    data_dir = os.path.join(project_root, 'data', 'ESA-Mission1')
+    metadata_file = os.path.join(project_root, 'processed_data', 'mission1_metadata.pkl')
+    verify_preprocessing(data_root=data_dir, metadata_file=metadata_file)

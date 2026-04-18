@@ -27,8 +27,9 @@ class RevIN(nn.Module):
 
     def _get_statistics(self, x):
         dim2reduce = tuple(range(1, x.ndim-1))
-        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
-        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
+        x_fp32 = x.float()
+        self.mean = torch.mean(x_fp32, dim=dim2reduce, keepdim=True).to(x.dtype).detach()
+        self.stdev = torch.sqrt(torch.var(x_fp32, dim=dim2reduce, keepdim=True, unbiased=False) + 1e-4).to(x.dtype).detach()
 
     def _normalize(self, x):
         x = x - self.mean
@@ -260,7 +261,7 @@ class MMPD(nn.Module):
         # Norm with stats
         mean = self.revin.mean.permute(0, 2, 1).reshape(-1, 1, 1) 
         stdev = self.revin.stdev.permute(0, 2, 1).reshape(-1, 1, 1)
-        x_0_norm = (x_0_patched - mean) / (stdev + 1e-6)
+        x_0_norm = (x_0_patched - mean) / (stdev + 1e-4)
         
         # Apply affine if needed
         if self.revin.affine:
@@ -386,7 +387,7 @@ class MMPD(nn.Module):
         if self.revin.affine:
             weight = self.revin.affine_weight.view(1, 1, 1, self.num_tm)
             bias = self.revin.affine_bias.view(1, 1, 1, self.num_tm)
-            mu_out = (mu_out - bias) / (weight + 1e-6)
+            mu_out = (mu_out - bias) / (weight + 1e-4)
             
         mu_out = mu_out * self.revin.stdev.unsqueeze(1) + self.revin.mean.unsqueeze(1)
         
