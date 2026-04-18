@@ -125,6 +125,21 @@ class PatchConsistentMLP(nn.Module):
         feat = torch.cat([x_t, H, t_emb, left_x, right_x], dim=-1)
         return self.mlp(feat)
 
+class ChannelMixing(nn.Module):
+    def __init__(self, num_tm):
+        super(ChannelMixing, self).__init__()
+        self.num_tm = num_tm
+        self.mixing = nn.Linear(num_tm, num_tm)
+        
+    def forward(self, H):
+        # H: [B*num_tm, N, D]
+        B_num_tm, N, D = H.shape
+        B = B_num_tm // self.num_tm
+        H = H.view(B, self.num_tm, N, D).permute(0, 2, 3, 1) # [B, N, D, num_tm]
+        H = self.mixing(H) # [B, N, D, num_tm]
+        H = H.permute(0, 3, 1, 2).reshape(B_num_tm, N, D)
+        return H
+
 class MMPD(nn.Module):
     def __init__(self, config):
         super(MMPD, self).__init__()
@@ -146,6 +161,8 @@ class MMPD(nn.Module):
         )
         if self.num_tc > 0:
             self.tc_proj = nn.Linear(self.num_tc * self.patch_len, config['d_model'])
+            
+        self.channel_mixing = ChannelMixing(self.num_tm)
             
         if config.get('ablation_no_transformer', False):
             self.denoiser = PatchConsistentMLP(config['d_model'], config['patch_len'], config['d_ff'])
@@ -226,6 +243,8 @@ class MMPD(nn.Module):
             tc_emb = self.tc_proj(tc_patched)
             tc_emb = tc_emb.repeat_interleave(self.num_tm, dim=0)
             H = H + tc_emb
+            
+        H = self.channel_mixing(H)
         
         N_target = self.pred_len // self.patch_len
         target_H = H[:, -N_target:, :]
@@ -292,18 +311,24 @@ class MMPD(nn.Module):
             tc_emb = tc_emb.repeat_interleave(self.num_tm, dim=0)
             H = H + tc_emb
             
+        H = self.channel_mixing(H)
+            
         N_target = self.pred_len // self.patch_len
-        target_H = H[:, -N_target:, :] # [B*num_tm, N_target, D]
+        target_H_single = H[:, -N_target:, :] # [B*num_tm, N_target, D]
+        
+        # Recon Initial Prior for GMM Mean
+        recon_patched = self.recon_head(target_H_single) # [B*num_tm, N_target, P]
+        recon_patched = recon_patched.reshape(B, self.num_tm, 1, N_target, self.patch_len) # [B, num_tm, 1, N_target, P]
         
         # Repeat context for num_samples trajectories
-        target_H = target_H.repeat(num_samples, 1, 1) # [num_samples * B * num_tm, N_target, D]
+        target_H = target_H_single.repeat(num_samples, 1, 1) # [num_samples * B * num_tm, N_target, D]
         
         # DDIM initialization (in normalized space)
         x_t = torch.randn((num_samples * B * self.num_tm, N_target, self.patch_len), device=x_cond.device)
         
-        # Evolving Variational GMM Initialization
+        # Evolving Variational GMM Initialization using Recon Prior
         pi = torch.ones(B, self.num_tm, gmm_K, device=x_cond.device) / gmm_K
-        mu = torch.randn(B, self.num_tm, gmm_K, N_target, self.patch_len, device=x_cond.device) * 0.1
+        mu = recon_patched.repeat(1, 1, gmm_K, 1, 1) + torch.randn(B, self.num_tm, gmm_K, N_target, self.patch_len, device=x_cond.device) * 0.05
         sigma = torch.ones(B, self.num_tm, gmm_K, device=x_cond.device)
         
         # Time steps

@@ -48,10 +48,11 @@ def run_inference(config, model_path):
     
     seq_len = config['seq_len']
     pred_len = config['pred_len']
-    stride = config.get('infer_stride', pred_len)
+    stride = config.get('infer_stride', max(1, pred_len // 2))
     
     num_timestamps = end_idx - start_idx
-    anomaly_scores = np.zeros(num_timestamps)
+    anomaly_scores_sum = np.zeros(num_timestamps)
+    anomaly_scores_cnt = np.zeros(num_timestamps)
     
     # Window starts relative to test set start
     starts = list(range(0, num_timestamps - seq_len - pred_len + 1, stride))
@@ -85,17 +86,16 @@ def run_inference(config, model_path):
             stage1_scores.extend(mse_mean)
             
     stage1_scores = np.array(stage1_scores)
-    threshold_idx = int(len(stage1_scores) * 0.95)
-    threshold_val = np.sort(stage1_scores)[threshold_idx]
+    mean_s1 = np.mean(stage1_scores)
+    std_s1 = np.std(stage1_scores)
+    threshold_val = mean_s1 + 3 * std_s1
     to_refine_indices = np.where(stage1_scores >= threshold_val)[0]
     
     # Write Base scores
     print("Writing Stage 1 base scores...")
     for idx, start in enumerate(starts):
-        anomaly_scores[start + seq_len : start + seq_len + pred_len] = np.maximum(
-            anomaly_scores[start + seq_len : start + seq_len + pred_len],
-            stage1_scores[idx]
-        )
+        anomaly_scores_sum[start + seq_len : start + seq_len + pred_len] += stage1_scores[idx]
+        anomaly_scores_cnt[start + seq_len : start + seq_len + pred_len] += 1
 
     # Stage 2: Fine Scoring
     print(f"Stage 2: Refining {len(to_refine_indices)} windows...")
@@ -138,10 +138,11 @@ def run_inference(config, model_path):
             
         for b, idx in enumerate(batch_indices):
             start = starts[idx]
-            anomaly_scores[start + seq_len : start + seq_len + pred_len] = np.maximum(
-                anomaly_scores[start + seq_len : start + seq_len + pred_len], nll[b]
-            )
-        
+            # Replace stage 1 score with stage 2 nll
+            anomaly_scores_sum[start + seq_len : start + seq_len + pred_len] -= stage1_scores[idx]
+            anomaly_scores_sum[start + seq_len : start + seq_len + pred_len] += nll[b]
+            
+    anomaly_scores = np.divide(anomaly_scores_sum, anomaly_scores_cnt, out=np.zeros_like(anomaly_scores_sum), where=anomaly_scores_cnt!=0)
     anomaly_scores = gaussian_filter1d(anomaly_scores, sigma=3)
     test_labels = label_mmap[start_idx : end_idx]
     
@@ -158,14 +159,14 @@ def dynamic_ewma_threshold(scores, alpha=0.1, z=3.0):
         ewma_std[i] = np.sqrt(var)
     return ewma + z * ewma_std
 
-def evaluate(scores, labels, times, threshold_pct=99, output_dir='results'):
+def evaluate(scores, labels, times, threshold_pct=99, output_dir='results', pa_k_ratio=0.1):
     from sklearn.metrics import precision_recall_fscore_support
     os.makedirs(output_dir, exist_ok=True)
     
     thresh_dynamic = dynamic_ewma_threshold(scores, alpha=0.1, z=3.0)
     pred = (scores > thresh_dynamic).astype(int)
     
-    # Event-wise Correction calculation
+    # Event-wise Correction calculation (Rigorous PA%K)
     def get_events(labels):
         events = []
         if len(labels) == 0: return events
@@ -184,17 +185,21 @@ def evaluate(scores, labels, times, threshold_pct=99, output_dir='results'):
     events = get_events(labels)
     corrected_pred = pred.copy()
     for s, e in events:
-        if pred[s:e].any():
+        if pred[s:e].mean() >= pa_k_ratio:
             corrected_pred[s:e] = 1
             
     # Calculate Metrics
-    p, r, f, _ = precision_recall_fscore_support(labels, corrected_pred, average='binary', beta=0.5)
+    p, r, f, _ = precision_recall_fscore_support(labels, corrected_pred, average='binary', beta=0.5, zero_division=0)
+    raw_p, raw_r, raw_f, _ = precision_recall_fscore_support(labels, pred, average='binary', beta=0.5, zero_division=0)
     
     summary = (
         f"Dynamic Thresholding (EWMA)\n"
-        f"Event-wise Corrected Precision: {p:.4f}\n"
-        f"Event-wise Corrected Recall: {r:.4f}\n"
-        f"Event-wise Corrected F0.5: {f:.4f}\n"
+        f"Raw Point-wise Precision: {raw_p:.4f}\n"
+        f"Raw Point-wise Recall: {raw_r:.4f}\n"
+        f"Raw Point-wise F0.5: {raw_f:.4f}\n"
+        f"Rigorous PA (>{pa_k_ratio*100}%) Precision: {p:.4f}\n"
+        f"Rigorous PA (>{pa_k_ratio*100}%) Recall: {r:.4f}\n"
+        f"Rigorous PA (>{pa_k_ratio*100}%) F0.5: {f:.4f}\n"
     )
     print(summary)
     
